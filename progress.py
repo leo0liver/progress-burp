@@ -12,41 +12,34 @@ from java.awt import Color
 from java.awt import Component
 from java.awt import Dimension
 from java.awt import Frame
-from java.awt.event import ActionListener
-from java.awt.event import FocusListener
-from java.awt.event import ItemListener
-from java.lang import Class
-from java.lang import ClassNotFoundException
-from java.lang import Integer
-from java.lang import Runnable
-from java.lang import String
-from java.sql import DriverManager
-from java.sql import SQLException
-from java.sql import Statement
-from java.sql import Types
-from javax.swing import BoxLayout
-from javax.swing import ButtonGroup
-from javax.swing import GroupLayout
-from javax.swing import JButton
-from javax.swing import JCheckBox
-from javax.swing import JFileChooser
-from javax.swing import JLabel
-from javax.swing import JMenu
-from javax.swing import JMenuItem
-from javax.swing import JOptionPane
-from javax.swing import JPanel
-from javax.swing import JPopupMenu
-from javax.swing import JRadioButton
-from javax.swing import JScrollPane
-from javax.swing import JSeparator
-from javax.swing import JSplitPane
-from javax.swing import JTabbedPane
-from javax.swing import JTable
-from javax.swing import JTextField
-from javax.swing import SwingUtilities
+from java.awt.event import ActionListener, FocusListener, ItemListener, ItemEvent
+from java.lang import Class, ClassNotFoundException, Integer, Runnable, String
+from java.sql import DriverManager, SQLException, Statement, Types
+from javax.swing import (
+    BoxLayout,
+    ButtonGroup,
+    GroupLayout,
+    JButton,
+    JCheckBox,
+    JComboBox,
+    JFileChooser,
+    JLabel,
+    JMenu,
+    JMenuItem,
+    JOptionPane,
+    JPanel,
+    JPopupMenu,
+    JRadioButton,
+    JScrollPane,
+    JSeparator,
+    JSplitPane,
+    JTabbedPane,
+    JTable,
+    JTextField,
+    SwingUtilities,
+)
 from javax.swing.event import DocumentListener
-from javax.swing.table import AbstractTableModel
-from javax.swing.table import DefaultTableCellRenderer
+from javax.swing.table import AbstractTableModel, DefaultTableCellRenderer
 from threading import Lock
 
 import json
@@ -278,7 +271,7 @@ class Table(JTable):
             yield self.getColumnName(i), self.getColumnModel().getColumn(i)
 
     def _get_storage_key(self):
-        return self.__class__.__name__
+        return self.__class__.__name__ 
 
 
 class TableColumnModel(object):
@@ -471,6 +464,7 @@ class Application(object):
         self,
         burp_services,
         database,
+        highlight_settings,
         item_repository,
         path_pattern_repository,
         ui_services,
@@ -502,6 +496,7 @@ class Application(object):
             ),
             InitCommand.__name__: InitCommandHandler(
                 duplicate_items,
+                highlight_settings,
                 persistence,
                 pre_analyze_validator,
                 pre_process_validator,
@@ -526,6 +521,7 @@ class Application(object):
             ),
             SetDomainDictValueCommand.__name__: SetDomainDictValueCommandHandler(
                 duplicate_items,
+                highlight_settings,
                 persistence,
                 pre_analyze_validator,
                 pre_process_validator,
@@ -567,24 +563,32 @@ class BurpExtender(IBurpExtender, IExtensionStateListener):
     def registerExtenderCallbacks(self, callbacks):
         BurpCallbacks.set_instance(callbacks)
         BurpHelpers.set_instance(callbacks.getHelpers())
-        self._prepare_application()
+        listener = HttpListener()
+        self._prepare_application(listener)
         callbacks.addSuiteTab(ProgressTab())
         callbacks.registerExtensionStateListener(self)
-        callbacks.registerHttpListener(HttpListener())
+        callbacks.registerHttpListener(listener)
         callbacks.setExtensionName('Progress Tracker v1.1')
 
     def extensionUnloaded(self):
         EventBus().notify(EventBus.EVENT_EXTENSION_UNLOADED, None)
 
-    def _prepare_application(self):
+    def _prepare_application(self, listener):
         database = Database(Logger())
+        value_repository = ValueRepository()
+        item_repository = ItemRepository(database)
+        path_pattern_repository = PathPatternRepository(database)
+        highlight_settings = HighlightSettings(value_repository)
+        duplicate_items = DuplicateItems(item_repository, path_pattern_repository, value_repository)
+        listener.set_dependencies(duplicate_items, highlight_settings)
         Application.set_instance(Application(
             BurpServices(),
             database,
-            ItemRepository(database),
-            PathPatternRepository(database),
+            highlight_settings,
+            item_repository,
+            path_pattern_repository,
             UIServices(),
-            ValueRepository()
+            value_repository
         ))
 
 
@@ -990,8 +994,44 @@ class HttpListener(IHttpListener):
     def __init__(self):
         self._burp_callbacks = BurpCallbacks.get_instance()
         self._burp_helpers = BurpHelpers.get_instance()
+        self._duplicate_items = None
+        self._highlight_settings = None
+
+    def set_dependencies(self, duplicate_items, highlight_settings):
+        self._duplicate_items = duplicate_items
+        self._highlight_settings = highlight_settings
+
+    def _highlight_item_in_proxy(self, tool_flag, message_info):
+        settings = self._highlight_settings.get_values()
+        if not settings.get('highlight_enabled'):
+            return
+
+        request_info, response_info = self._analyze_message(message_info)
+        
+        # Create a temporary item to find duplicates
+        path = self._get_graphql_operation_name(request_info, message_info.getRequest()) or request_info.getUrl().getPath()
+        temp_item = Item(None, message_info.getHttpService().getHost(), None, request_info.getMethod(), path, message_info.getHttpService().getPort(), message_info.getHttpService().getProtocol(), None, None, None, None, None, None)
+
+        found_items = self._duplicate_items._find_duplicate_items(temp_item)
+        
+        if found_items:
+            # Existing item logic
+            item = found_items[-1] 
+            if item.get_status() == settings.get('highlight_status'):
+                message_info.setHighlight(settings.get('highlight_color'))
+        else:
+            # New item logic
+            if settings.get('highlight_status') == 'New':
+                # Check if this item is destined to be added to the repository
+                if self._is_pre_analyze_validation_pass(tool_flag) and self._is_pre_process_validation_pass(request_info, response_info):
+                    message_info.setHighlight(settings.get('highlight_color'))
 
     def processHttpMessage(self, tool_flag, message_is_request, message_info):
+        # Synchronous highlighting for Proxy tool
+        if self._duplicate_items and tool_flag == IBurpExtenderCallbacks.TOOL_PROXY and not message_is_request:
+            self._highlight_item_in_proxy(tool_flag, message_info)
+
+        # Asynchronous item processing (existing logic)
         if tool_flag not in [
             IBurpExtenderCallbacks.TOOL_PROXY,
             IBurpExtenderCallbacks.TOOL_REPEATER,
@@ -1026,14 +1066,52 @@ class HttpListener(IHttpListener):
             str(response_info.getStatusCode())
         )
 
+    def _get_graphql_operation_name(self, request_info, request_bytes):
+        try:
+            if request_info.getMethod() != 'POST':
+                return None
+
+            headers = request_info.getHeaders()
+            content_type = None
+            for header in headers:
+                if header.lower().startswith("content-type:"):
+                    content_type = header.split(":", 1)[1].strip()
+                    break
+
+            if not (content_type and (content_type.startswith('application/json') or content_type.startswith('application/graphql'))):
+                return None
+
+            body_offset = request_info.getBodyOffset()
+            body_bytes = request_bytes[body_offset:]
+            body_str = self._burp_helpers.bytesToString(body_bytes)
+
+            if '"operationName"' not in body_str:
+                return None
+
+            json_body = json.loads(body_str)
+            operation_name = json_body.get('operationName')
+
+            if operation_name:
+                return "[GraphQL] %s" % operation_name
+        except Exception:
+            # Ignore exceptions during parsing
+            pass
+
+        return None
+
     def _create_process_http_dialog_command(self, tool_flag, request_info, message_info):
+        request_bytes = message_info.getRequest()
+        operation_name = self._get_graphql_operation_name(request_info, request_bytes)
+        path = operation_name if operation_name is not None else request_info.getUrl().getPath()
+
         return ProcessHttpDialogCommand(
             request_info.getMethod(),
-            self._save_to_temp_file(message_info.getRequest()),
+            self._save_to_temp_file(request_bytes),
             self._save_to_temp_file(message_info.getResponse()),
             datetime.now().strftime('%H:%M:%S %d %b %Y'),
             self._burp_callbacks.getToolName(tool_flag),
-            request_info.getUrl()
+            request_info.getUrl(),
+            path
         )
 
     def _save_to_temp_file(self, data):
@@ -1106,6 +1184,7 @@ class InitCommandHandler(object):
     def __init__(
             self,
             duplicate_items,
+            highlight_settings,
             persistence,
             pre_analyze_validator,
             pre_process_validator,
@@ -1116,6 +1195,7 @@ class InitCommandHandler(object):
     ):
         self._domain_dicts = [
             duplicate_items,
+            highlight_settings,
             persistence,
             pre_analyze_validator,
             pre_process_validator,
@@ -1254,19 +1334,19 @@ class ItemRepository(Repository):
     def _create_table(self):
         self._database.execute(
             'CREATE TABLE items('
-            'comment TEXT NOT NULL,'
-            'host TEXT NOT NULL,'
-            'id INTEGER PRIMARY KEY,'
-            'method TEXT NOT NULL,'
-            'path TEXT NOT NULL,'
-            'port INTEGER NOT NULL,'
-            'protocol TEXT NOT NULL,'
-            'request TEXT NOT NULL,'
-            'response TEXT NOT NULL,'
-            'status TEXT NOT NULL,'
-            'tags TEXT NOT NULL,'
-            'time TEXT NOT NULL,'
-            'tool TEXT NOT NULL,'
+            'comment TEXT NOT NULL,
+            'host TEXT NOT NULL,
+            'id INTEGER PRIMARY KEY,
+            'method TEXT NOT NULL,
+            'path TEXT NOT NULL,
+            'port INTEGER NOT NULL,
+            'protocol TEXT NOT NULL,
+            'request TEXT NOT NULL,
+            'response TEXT NOT NULL,
+            'status TEXT NOT NULL,
+            'tags TEXT NOT NULL,
+            'time TEXT NOT NULL,
+            'tool TEXT NOT NULL,
             'UNIQUE(protocol, host, port, method, path) ON CONFLICT IGNORE)'
         )
 
@@ -1518,6 +1598,69 @@ class MakePreProcessValidationCommandHandler(object):
         )
 
 
+class HighlightSettings(DomainDict):
+    def _get_default_values(self):
+        return {
+            'highlight_enabled': False,
+            'highlight_status': 'New',
+            'highlight_color': 'orange',
+        }
+
+    def _get_storage_key(self):
+        return 'HighlightSettings'
+
+
+class HighlightPanel(JPanel, ItemListener):
+    __metaclass__ = Singleton
+    COLORS = ["red", "orange", "yellow", "green", "blue", "pink", "magenta", "gray"]
+
+    def __init__(self):
+        super(HighlightPanel, self).__init__()
+        self._check_box = None
+        self._status_combo = None
+        self._color_combo = None
+
+    def display(self, values):
+        self._check_box = JCheckBox("Enable highlighting in Proxy history")
+        self._check_box.setSelected(values.get('highlight_enabled', False))
+        self._check_box.addItemListener(self)
+
+        self._status_combo = JComboBox(Application.ITEM_STATUSES)
+        self._status_combo.setSelectedItem(values.get('highlight_status', 'New'))
+        self._status_combo.addItemListener(self)
+
+        self._color_combo = JComboBox(self.COLORS)
+        self._color_combo.setSelectedItem(values.get('highlight_color', 'orange'))
+        self._color_combo.addItemListener(self)
+
+        self.add(self._check_box)
+        self.add(JLabel("Status:"))
+        self.add(self._status_combo)
+        self.add(JLabel("Color:"))
+        self.add(self._color_combo)
+
+    def itemStateChanged(self, event):
+        source = event.getSource()
+        if source == self._check_box:
+            Application.get_instance().execute(SetDomainDictValueCommand(
+                SetDomainDictValueCommand.TYPE_HIGHLIGHT_SETTINGS,
+                'highlight_enabled',
+                self._check_box.isSelected()
+            ))
+        elif source == self._status_combo and event.getStateChange() == ItemEvent.SELECTED:
+            Application.get_instance().execute(SetDomainDictValueCommand(
+                SetDomainDictValueCommand.TYPE_HIGHLIGHT_SETTINGS,
+                'highlight_status',
+                self._status_combo.getSelectedItem()
+            ))
+        elif source == self._color_combo and event.getStateChange() == ItemEvent.SELECTED:
+            Application.get_instance().execute(SetDomainDictValueCommand(
+                SetDomainDictValueCommand.TYPE_HIGHLIGHT_SETTINGS,
+                'highlight_color',
+                self._color_combo.getSelectedItem()
+            ))
+
+
 class OptionsPanel(JPanel):
     def __init__(self):
         super(OptionsPanel, self).__init__()
@@ -1534,6 +1677,8 @@ class OptionsPanel(JPanel):
         self._add_panel(OverwriteDuplicateItemsPanel())
         self._add_panel(ProcessOnlyInScopeRequestsPanel())
         self._add_panel(SetInProgressStatusWhenSendingItemToToolPanel())
+        self._add_label('Highlighting')
+        self._add_panel(HighlightPanel())
 
     def _add_label(self, label):
         panel = JPanel()
@@ -1596,10 +1741,10 @@ class PathPatternRepository(Repository):
     def _create_table(self):
         self._database.execute(
             'CREATE TABLE path_patterns('
-            'id INTEGER PRIMARY KEY,'
-            'method TEXT NOT NULL,'
-            'path_regexp TEXT NOT NULL,'
-            'target TEXT NOT NULL,'
+            'id INTEGER PRIMARY KEY,
+            'method TEXT NOT NULL,
+            'path_regexp TEXT NOT NULL,
+            'target TEXT NOT NULL,
             'UNIQUE(method, path_regexp, target) ON CONFLICT IGNORE)'
         )
 
@@ -1817,13 +1962,14 @@ class PreProcessValidator(DomainDictWithLock):
 
 
 class ProcessHttpDialogCommand(object):
-    def __init__(self, method, request, response, time, tool, url):
+    def __init__(self, method, request, response, time, tool, url, path):
         self.method = method
         self.request = request
         self.response = response
         self.time = time
         self.tool = tool
         self.url = url
+        self.path = path
 
 
 class ProcessHttpDialogCommandHandler(object):
@@ -1843,7 +1989,7 @@ class ProcessHttpDialogCommandHandler(object):
             command.url.getHost(),
             None,
             command.method,
-            command.url.getPath(),
+            command.path,
             command.url.getPort(),
             command.url.getProtocol(),
             command.request,
@@ -1999,9 +2145,12 @@ class SelectedItems(SelectedObjects):
         return self._item_repository.find_by_ids(self._values['object_ids'])
 
     def _get_main_selected_item_property(self, property):
-        item = self._find_main_selected_item()
-        if item:
-            return getattr(item, 'get_%s' % property)()
+        main_selected_item = self._find_main_selected_item()
+        if main_selected_item:
+            value = getattr(main_selected_item, 'get_%s' % property)()
+            if isinstance(value, list):
+                return InfrastructureHelpers.join(value)
+            return value
 
     def _get_object_plural_name(self):
         return 'items'
@@ -2038,6 +2187,7 @@ class SetDomainDictValueCommand(object):
     TYPE_SELECTED_ITEMS = 5
     TYPE_SELECTED_PATH_PATTERNS = 6
     TYPE_VISIBLE_ITEMS = 7
+    TYPE_HIGHLIGHT_SETTINGS = 8
 
     def __init__(self, type, key, value):
         self.type = type
@@ -2047,27 +2197,29 @@ class SetDomainDictValueCommand(object):
 
 class SetDomainDictValueCommandHandler(object):
     def __init__(
-            self,
-            duplicate_items,
-            persistence,
-            pre_analyze_validator,
-            pre_process_validator,
-            selected_items,
-            selected_path_patterns,
-            visible_items
+        self,
+        duplicate_items,
+        highlight_settings,
+        persistence,
+        pre_analyze_validator,
+        pre_process_validator,
+        selected_items,
+        selected_path_patterns,
+        visible_items
     ):
-        self._domain_dicts = {
+        self._domain_dict_handlers = {
             SetDomainDictValueCommand.TYPE_DUPLICATE_ITEMS: duplicate_items,
+            SetDomainDictValueCommand.TYPE_HIGHLIGHT_SETTINGS: highlight_settings,
             SetDomainDictValueCommand.TYPE_PERSISTENCE: persistence,
             SetDomainDictValueCommand.TYPE_PRE_ANALYZE_VALIDATOR: pre_analyze_validator,
             SetDomainDictValueCommand.TYPE_PRE_PROCESS_VALIDATOR: pre_process_validator,
             SetDomainDictValueCommand.TYPE_SELECTED_ITEMS: selected_items,
             SetDomainDictValueCommand.TYPE_SELECTED_PATH_PATTERNS: selected_path_patterns,
-            SetDomainDictValueCommand.TYPE_VISIBLE_ITEMS: visible_items
+            SetDomainDictValueCommand.TYPE_VISIBLE_ITEMS: visible_items,
         }
 
     def handle(self, command):
-        return self._domain_dicts[command.type].set_value(command.key, command.value)
+        return self._domain_dict_handlers[command.type].set_value(command.key, command.value)
 
 
 class SetInProgressStatusWhenSendingItemToToolPanel(CheckBoxPanel):
@@ -2078,12 +2230,12 @@ class SetInProgressStatusWhenSendingItemToToolPanel(CheckBoxPanel):
         return SetDomainDictValueCommand.TYPE_SELECTED_ITEMS
 
     def _get_label(self):
-        return '<html>Set <i>In progress</i> status when sending item to tool</html>'
+        return 'Set "In progress" status when sending item to tool'
 
 
 class SetItemPropertyCommand(object):
-    def __init__(self, item_id, property, value):
-        self.item_id = item_id
+    def __init__(self, id, property, value):
+        self.id = id
         self.property = property
         self.value = value
 
@@ -2094,7 +2246,7 @@ class SetItemPropertyCommandHandler(object):
         self._visible_items = visible_items
 
     def handle(self, command):
-        self._item_repository.update_property_by_id(command.property, command.value, command.item_id)
+        self._item_repository.update_property_by_id(command.property, command.value, command.id)
         self._visible_items.display()
 
 
@@ -2115,27 +2267,26 @@ class SetSelectedItemPropertiesCommandHandler(object):
 
 
 class StatusCellRenderer(DefaultTableCellRenderer):
-    _LABEL_COLORS = {
-        # foreground, background
-        'Blocked': [Color(0xf0f0f0), Color(0x1B1C1D)],
-        'Done': [Color(0x1B1C1D), Color(0x21BA45)],
-        'Ignored': [Color(0x1B1C1D), Color(0x767676)],
-        'In progress': [Color(0x1B1C1D), Color(0xFBBD08)],
-        'Postponed': [Color(0x1B1C1D), Color(0xF2711C)],
-        'New': [Color(0x1B1C1D), Color(0xDB2828)],
+    COLORS = {
+        'Blocked': Color(255, 192, 203),
+        'Done': Color(144, 238, 144),
+        'Ignored': Color.LIGHT_GRAY,
+        'In progress': Color(255, 255, 224),
+        'New': Color.WHITE,
+        'Postponed': Color(135, 206, 250),
     }
 
-    def getTableCellRendererComponent(self, table, value, is_selected, has_focus, row, col):
-        cell = super(StatusCellRenderer, self).getTableCellRendererComponent(
-            table, value, is_selected, has_focus, row, col
+    def getTableCellRendererComponent(self, table, value, is_selected, has_focus, row, column):
+        component = super(StatusCellRenderer, self).getTableCellRendererComponent(
+            table,
+            value,
+            is_selected,
+            has_focus,
+            row,
+            column
         )
-        cell.setForeground(
-            table.getSelectionForeground() if is_selected else self._LABEL_COLORS[value][0]
-        )
-        cell.setBackground(
-            table.getSelectionBackground() if is_selected else self._LABEL_COLORS[value][1]
-        )
-        return cell
+        component.setBackground(self.COLORS[value])
+        return component
 
 
 class StatusPanel(JPanel, ItemListener):
@@ -2169,17 +2320,18 @@ class StatusPanel(JPanel, ItemListener):
 class TagOperatorPanel(JPanel, ItemListener):
     __metaclass__ = Singleton
 
-    _OPERATORS = ['AND', 'OR']
+    _OPTIONS = ['OR', 'AND']
 
     def __init__(self):
         super(TagOperatorPanel, self).__init__()
         self._buttons = []
 
     def display(self, values):
+        self.add(JLabel('<html><b>Tag operator:</b></html>'))
         button_group = ButtonGroup()
-        for operator in self._OPERATORS:
-            button = JRadioButton(operator)
-            button.setSelected(operator == values['tags_operator'])
+        for option in self._OPTIONS:
+            button = JRadioButton(option)
+            button.setSelected(option == values['tag_operator'])
             button.addItemListener(self)
             button_group.add(button)
             self._buttons.append(button)
@@ -2190,217 +2342,172 @@ class TagOperatorPanel(JPanel, ItemListener):
             if button.isSelected():
                 Application.get_instance().execute(SetDomainDictValueCommand(
                     SetDomainDictValueCommand.TYPE_VISIBLE_ITEMS,
-                    'tags_operator',
+                    'tag_operator',
                     button.getLabel()
                 ))
                 break
 
 
-class TagPanel(JPanel, DocumentListener):
+class TagPanel(JPanel, FocusListener):
     __metaclass__ = Singleton
 
     def __init__(self):
         super(TagPanel, self).__init__()
         self._text_field = None
 
-    def changeUpdate(self, event):
-        self._update()
+    def focusGained(self, event):
+        pass
 
-    def insertUpdate(self, event):
-        self._update()
-
-    def removeUpdate(self, event):
-        self._update()
-
-    def display(self, values):
-        self.add(JLabel('<html><b>Tags:</b></html>'))
-        self._text_field = JTextField()
-        self._text_field.setColumns(20)
-        self._text_field.setEditable(True)
-        self._text_field.setText(InfrastructureHelpers.join(values['tags']))
-        self._text_field.getDocument().addDocumentListener(self)
-        self.add(self._text_field)
-
-    def _update(self):
+    def focusLost(self, event):
         Application.get_instance().execute(SetDomainDictValueCommand(
             SetDomainDictValueCommand.TYPE_VISIBLE_ITEMS,
             'tags',
             InfrastructureHelpers.split(self._text_field.getText())
         ))
 
+    def display(self, values):
+        self.add(JLabel('<html><b>Tags:</b></html>'))
+        self._prepare_components(values)
+
+    def _prepare_components(self, values):
+        self._text_field = JTextField()
+        self._text_field.setColumns(30)
+        self._text_field.setEditable(True)
+        self._text_field.setText(InfrastructureHelpers.join(values['tags']))
+        self._text_field.addFocusListener(self)
+        self.add(self._text_field)
+
 
 class UIHelpers(object):
     @staticmethod
-    def ask_for_value(title, message, initial_value, is_value_array):
-        value = JOptionPane.showInputDialog(
-            UIHelpers._get_parent_frame(),
+    def ask_for_value(title, message, value, is_value_array):
+        new_value = JOptionPane.showInputDialog(
+            Frame(),
             message,
             title,
             JOptionPane.PLAIN_MESSAGE,
             None,
             None,
-            InfrastructureHelpers.join(initial_value) if is_value_array else initial_value
+            value
         )
-        if value is not None and is_value_array:
-            return InfrastructureHelpers.split(value)
-        return value
+        if new_value is not None:
+            if is_value_array:
+                return InfrastructureHelpers.split(new_value)
+            return new_value
 
     @staticmethod
     def choose_file():
-        file_chooser = JFileChooser()
-        if file_chooser.showSaveDialog(UIHelpers._get_parent_frame()) == JFileChooser.APPROVE_OPTION:
-            return str(file_chooser.getSelectedFile())
+        chooser = JFileChooser()
+        if chooser.showSaveDialog(Frame()) == JFileChooser.APPROVE_OPTION:
+            return chooser.getSelectedFile().getCanonicalPath()
 
     @staticmethod
-    def confirm(question):
-        chosen_option = JOptionPane.showConfirmDialog(
-            UIHelpers._get_parent_frame(),
-            question,
-            'Confirm',
-            JOptionPane.YES_NO_OPTION,
-            JOptionPane.WARNING_MESSAGE
-        )
-        return chosen_option == JOptionPane.YES_OPTION
+    def confirm(message):
+        return JOptionPane.showConfirmDialog(
+            Frame(),
+            message,
+            'Confirmation',
+            JOptionPane.YES_NO_OPTION
+        ) == JOptionPane.YES_OPTION
 
     @staticmethod
     def display_error(message):
         JOptionPane.showMessageDialog(
-            UIHelpers._get_parent_frame(),
+            Frame(),
             message,
             'Error',
             JOptionPane.ERROR_MESSAGE
         )
 
-    @staticmethod
-    def _get_parent_frame():
-        for frame in Frame.getFrames():
-            if 'burp suite' in frame.getTitle().lower():
-                return frame
-
 
 class UIServices(object):
     def __init__(self):
-        self._http_dialog_editor = HttpDialogEditor()
-        self._models = {
-            'item': ItemsModel(),
-            'path_pattern': PathPatternsModel(),
-        }
-        self._panels_to_display = [
+        self._panels = [
             CapturingPanel(),
             DatabasePanel(),
             ExcludedExtensionsPanel(),
             ExcludedStatusCodesPanel(),
+            HighlightPanel(),
             OverwriteDuplicateItemsPanel(),
             ProcessOnlyInScopeRequestsPanel(),
             ScopeToolsPanel(),
             SetInProgressStatusWhenSendingItemToToolPanel(),
             StatusPanel(),
-            TagPanel(),
             TagOperatorPanel(),
+            TagPanel(),
         ]
+        self._tables = {
+            'Items': ItemsTable(),
+            'PathPatterns': PathPatternsTable(),
+        }
 
-    @staticmethod
-    def ask_for_value(title, message, initial_value, is_value_array):
-        return UIHelpers.ask_for_value(title, message, initial_value, is_value_array)
+    def ask_for_value(self, title, message, value, is_value_array):
+        return UIHelpers.ask_for_value(title, message, value, is_value_array)
 
-    @staticmethod
-    def confirm(question):
-        return UIHelpers.confirm(question)
+    def confirm(self, message):
+        return UIHelpers.confirm(message)
 
-    @staticmethod
-    def display_error(message):
+    def display_error(self, message):
         UIHelpers.display_error(message)
 
     def display_http_dialog(self, item):
-        self._http_dialog_editor.display(item)
+        HttpDialogEditor().display(item)
 
     def display_objects(self, type, objects):
-        self._models[type].display(objects)
+        self._tables[type].getModel().display(objects)
 
     def display_panels(self, values):
-        for panel_to_display in self._panels_to_display:
-            panel_to_display.display(values)
+        for panel in self._panels:
+            panel.display(values)
 
 
-class ValueRepository(IHttpRequestResponse):
-    _HOST = 'progress-plugin-storage-f2a8e0dd-7b23-4617-b556-c3b88edf6895'
-    _PORT = 443
-    _PROTOCOL = 'https'
+class ValueRepository(object):
+    __metaclass__ = Singleton
 
     def __init__(self):
         self._burp_callbacks = BurpCallbacks.get_instance()
-        self._burp_helpers = BurpHelpers.get_instance()
 
     def get(self, key, default_value):
-        http_request_responses = self._burp_callbacks.getSiteMap(self._prepare_prefix(key))
-        if len(http_request_responses) == 1:
-            response = http_request_responses[0].getResponse()
-            response_info = self._burp_helpers.analyzeResponse(response)
-            return json.loads(self._burp_helpers.bytesToString(response[response_info.getBodyOffset():]))
-        return default_value
+        value = self._burp_callbacks.loadExtensionSetting(key)
+        if value is None:
+            return default_value
+        return json.loads(value)
 
     def set(self, key, value):
-        self._burp_callbacks.addToSiteMap(
-            HttpRequestResponse(
-                self._burp_helpers.buildHttpService(self._HOST, self._PORT, self._PROTOCOL),
-                self._prepare_request(key),
-                self._prepare_response(json.dumps(value))
-            )
-        )
-
-    def _prepare_prefix(self, key):
-        return '%s://%s/%s' % (self._PROTOCOL, self._HOST, key)
-
-    def _prepare_request(self, key):
-        request  = 'GET /%s HTTP/1.1\r\n' % key
-        request += 'Host: %s\r\n' % self._HOST
-        request += '\r\n'
-        return self._burp_helpers.stringToBytes(request)
-
-    def _prepare_response(self, value):
-        date = formatdate(timeval=None, localtime=False, usegmt=True)
-        response  = 'HTTP/1.1 200 OK\r\n'
-        response += 'Date: %s\r\n' % date
-        response += 'Last-Modified: %s\r\n' % date
-        response += 'Content-Type: text/plain\r\n'
-        response += 'Content-Length: %d\r\n' % len(value)
-        response += '\r\n'
-        response += value
-        return self._burp_helpers.stringToBytes(response)
+        self._burp_callbacks.saveExtensionSetting(key, json.dumps(value))
 
 
 class VisibleItems(VisibleObjects):
     def __init__(self, item_repository, ui_services, value_repository):
         super(VisibleItems, self).__init__(item_repository, ui_services, value_repository)
 
-    # DomainDict
+    # VisibleObjects
     def _get_default_values(self):
         return {
-            'statuses': ['In progress', 'New'],
+            'statuses': Application.ITEM_STATUSES,
             'tags': [],
-            'tags_operator': 'AND',
+            'tag_operator': 'OR',
         }
 
-    # business logic
     def _get_filters(self):
-        filters = [ItemsByStatusesFilter(self._values['statuses'])]
+        filters = [
+            ItemsByStatusesFilter(self._values['statuses'])
+        ]
         if self._values['tags']:
-            filters.append(ItemsByTagsFilter(self._values['tags'], self._values['tags_operator']))
+            filters.append(ItemsByTagsFilter(self._values['tags'], self._values['tag_operator']))
         return filters
 
-    @staticmethod
-    def _get_object_type():
-        return 'item'
+    def _get_object_type(self):
+        return 'Items'
 
 
 class VisiblePathPatterns(VisibleObjects):
-    def __init__(self, item_repository, ui_services, value_repository):
-        super(VisiblePathPatterns, self).__init__(item_repository, ui_services, value_repository)
+    def __init__(self, path_pattern_repository, ui_services, value_repository):
+        super(VisiblePathPatterns, self).__init__(path_pattern_repository, ui_services, value_repository)
 
-    @staticmethod
-    def _get_filters():
+    # VisibleObjects
+    def _get_filters(self):
         return []
 
-    @staticmethod
-    def _get_object_type():
-        return 'path_pattern'
+    def _get_object_type(self):
+        return 'PathPatterns'
