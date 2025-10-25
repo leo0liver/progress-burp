@@ -1,5 +1,7 @@
+
 from burp import IBurpExtender
 from burp import IBurpExtenderCallbacks
+from burp import IContextMenuFactory
 from burp import IExtensionStateListener
 from burp import IHttpListener
 from burp import IHttpRequestResponse
@@ -271,7 +273,7 @@ class Table(JTable):
             yield self.getColumnName(i), self.getColumnModel().getColumn(i)
 
     def _get_storage_key(self):
-        return self.__class__.__name__ 
+        return self.__class__.__name__
 
 
 class TableColumnModel(object):
@@ -445,9 +447,175 @@ class AddPathPatternCommandHandler(object):
                 self._visible_path_patterns.display()
 
 
+class GraphqlHelpers(object):
+    @staticmethod
+    def get_operation_name(helpers, request_info, request_bytes):
+        try:
+            if request_info.getMethod() != 'POST':
+                return None
+
+            headers = request_info.getHeaders()
+            content_type = None
+            for header in headers:
+                if header.lower().startswith("content-type:"):
+                    content_type = header.split(":", 1)[1].strip()
+                    break
+
+            if not (content_type and (content_type.startswith('application/json') or content_type.startswith('application/graphql'))):
+                return None
+
+            body_offset = request_info.getBodyOffset()
+            body_bytes = request_bytes[body_offset:]
+            body_str = helpers.bytesToString(body_bytes)
+
+            if '"operationName"' not in body_str:
+                return None
+
+            json_body = json.loads(body_str)
+            operation_name = json_body.get('operationName')
+
+            if operation_name:
+                return "[GraphQL] %s" % operation_name
+        except Exception:
+            pass # Ignore exceptions
+
+        return None
+
+class ContextMenuFactory(IContextMenuFactory, ActionListener):
+    def __init__(self, duplicate_items, helpers, ui_services):
+        self._duplicate_items = duplicate_items
+        self._helpers = helpers
+        self._ui_services = ui_services
+        self._invocation = None
+
+    def createMenuItems(self, invocation):
+        self._invocation = invocation
+        
+        menu_items = []
+        
+        # 1. Get Status item
+        get_status_item = JMenuItem("Get Progress Status")
+        get_status_item.addActionListener(self)
+        menu_items.append(get_status_item)
+
+        # 2. Set Status sub-menu
+        set_status_menu = JMenu("Set Progress Status")
+        for status in Application.ITEM_STATUSES:
+            sub_item = JMenuItem(status)
+            sub_item.addActionListener(self)
+            set_status_menu.add(sub_item)
+        
+        menu_items.append(set_status_menu)
+
+        return menu_items
+
+    def actionPerformed(self, event):
+        command = event.getActionCommand()
+
+        if command == "Get Progress Status":
+            self._get_request_status()
+        elif command in Application.ITEM_STATUSES:
+            self._set_request_status(command)
+
+    def _get_request_status(self):
+        if not self._invocation or not self._invocation.getSelectedMessages():
+            return
+
+        selected_message = self._invocation.getSelectedMessages()[0]
+        request_info = self._helpers.analyzeRequest(selected_message)
+        request_bytes = selected_message.getRequest()
+
+        path = GraphqlHelpers.get_operation_name(self._helpers, request_info, request_bytes) or request_info.getUrl().getPath()
+        
+        temp_item = Item(
+            None, selected_message.getHttpService().getHost(), None, 
+            request_info.getMethod(), path, selected_message.getHttpService().getPort(), 
+            selected_message.getHttpService().getProtocol(), None, None, None, None, None, None
+        )
+
+        found_items = self._duplicate_items._find_duplicate_items(temp_item)
+
+        if found_items:
+            item = found_items[-1]
+            message = "Status: %s\n" % item.get_status()
+            if item.get_comment():
+                message += "Comment: %s\n" % item.get_comment()
+            if item.get_tags():
+                message += "Tags: %s" % ", ".join(item.get_tags())
+            
+            self._ui_services.display_info(message, "Progress Status")
+        else:
+            self._ui_services.display_info("This request is not currently tracked by Progress Tracker.", "Progress Status")
+
+    def _set_request_status(self, status):
+        if not self._invocation or not self._invocation.getSelectedMessages():
+            return
+        
+        selected_message = self._invocation.getSelectedMessages()[0]
+        
+        Application.get_instance().execute(
+            SetRequestStatusCommand(selected_message, status)
+        )
+
+class SetRequestStatusCommand(object):
+    def __init__(self, message_info, status):
+        self.message_info = message_info
+        self.status = status
+
+class SetRequestStatusCommandHandler(object):
+    def __init__(self, duplicate_items, item_repository, ui_services, visible_items, burp_callbacks, burp_helpers):
+        self._duplicate_items = duplicate_items
+        self._item_repository = item_repository
+        self._ui_services = ui_services
+        self._visible_items = visible_items
+        self._burp_callbacks = burp_callbacks
+        self._burp_helpers = burp_helpers
+
+    def handle(self, command):
+        message_info = command.message_info
+        status = command.status
+
+        request_info = self._burp_helpers.analyzeRequest(message_info)
+        request_bytes = message_info.getRequest()
+
+        path = GraphqlHelpers.get_operation_name(self._burp_helpers, request_info, request_bytes) or request_info.getUrl().getPath()
+        
+        temp_item = Item(
+            None, message_info.getHttpService().getHost(), None, 
+            request_info.getMethod(), path, message_info.getHttpService().getPort(), 
+            message_info.getHttpService().getProtocol(), None, None, None, None, None, None
+        )
+
+        found_items = self._duplicate_items._find_duplicate_items(temp_item)
+
+        if found_items:
+            item_id = found_items[-1].get_id()
+            self._item_repository.update_property_by_id('status', status, item_id)
+        else:
+            # If item doesn't exist, create it
+            new_item = Item(
+                '',
+                message_info.getHttpService().getHost(),
+                None,
+                request_info.getMethod(),
+                path,
+                message_info.getHttpService().getPort(),
+                message_info.getHttpService().getProtocol(),
+                self._burp_callbacks.saveToTempFile(request_bytes),
+                self._burp_callbacks.saveToTempFile(message_info.getResponse()),
+                status, # Set the desired status directly
+                [],
+                datetime.now().strftime('%H:%M:%S %d %b %Y'),
+                'ContextMenu' # Set a static tool name for items created from the context menu
+            )
+            self._duplicate_items.add_item(new_item)
+
+        self._ui_services.display_info("Status set to: %s" % status, "Progress Status Updated")
+        self._visible_items.display() # Refresh the table UI
+
 class Application(object):
     ACTION_TOOLS = ['Intruder', 'Repeater', 'Scanner']
-    ITEM_STATUSES = ['Blocked', 'Done', 'Ignored', 'In progress', 'New', 'Postponed']
+    ITEM_STATUSES = ['New', 'Done', 'AuthTested', 'NA',]
     SCOPE_TOOLS = ['Proxy', 'Repeater', 'Target']
 
     _instance = None
@@ -536,6 +704,14 @@ class Application(object):
             SetSelectedItemPropertiesCommand.__name__: SetSelectedItemPropertiesCommandHandler(
                 selected_items,
                 visible_items
+            ),
+            SetRequestStatusCommand.__name__: SetRequestStatusCommandHandler(
+                duplicate_items,
+                item_repository,
+                ui_services,
+                visible_items,
+                BurpCallbacks.get_instance(),
+                BurpHelpers.get_instance()
             )
         }
         self.execute(InitCommand())
@@ -563,33 +739,44 @@ class BurpExtender(IBurpExtender, IExtensionStateListener):
     def registerExtenderCallbacks(self, callbacks):
         BurpCallbacks.set_instance(callbacks)
         BurpHelpers.set_instance(callbacks.getHelpers())
+        helpers = BurpHelpers.get_instance()
+
         listener = HttpListener()
-        self._prepare_application(listener)
+        context_menu_factory = self._prepare_application(listener, helpers)
+        
         callbacks.addSuiteTab(ProgressTab())
         callbacks.registerExtensionStateListener(self)
         callbacks.registerHttpListener(listener)
+        callbacks.registerContextMenuFactory(context_menu_factory)
         callbacks.setExtensionName('Progress Tracker v1.1')
 
     def extensionUnloaded(self):
         EventBus().notify(EventBus.EVENT_EXTENSION_UNLOADED, None)
 
-    def _prepare_application(self, listener):
+    def _prepare_application(self, listener, helpers):
         database = Database(Logger())
         value_repository = ValueRepository()
+        ui_services = UIServices()
         item_repository = ItemRepository(database)
         path_pattern_repository = PathPatternRepository(database)
         highlight_settings = HighlightSettings(value_repository)
         duplicate_items = DuplicateItems(item_repository, path_pattern_repository, value_repository)
+        
         listener.set_dependencies(duplicate_items, highlight_settings)
+        
+        context_menu_factory = ContextMenuFactory(duplicate_items, helpers, ui_services)
+
         Application.set_instance(Application(
             BurpServices(),
             database,
             highlight_settings,
             item_repository,
             path_pattern_repository,
-            UIServices(),
+            ui_services,
             value_repository
         ))
+
+        return context_menu_factory
 
 
 class BurpHelpers(object):
@@ -638,7 +825,7 @@ class CapturingPanel(JPanel, ItemListener):
         self._buttons = []
 
     def display(self, values):
-        self.add(JLabel('<html><b>Capturing:</b></html'))
+        self.add(JLabel('Capturing:'))
         button_group = ButtonGroup()
         for option in self._OPTIONS:
             button = JRadioButton(option)
@@ -800,7 +987,7 @@ class DatabasePanel(JPanel, ActionListener):
                 SetDomainDictValueCommand.TYPE_PERSISTENCE,
                 'database_path',
                 database_path
-            )):
+            )): #
                 self._text_field.setText(database_path)
 
     def display(self, values):
@@ -1067,37 +1254,7 @@ class HttpListener(IHttpListener):
         )
 
     def _get_graphql_operation_name(self, request_info, request_bytes):
-        try:
-            if request_info.getMethod() != 'POST':
-                return None
-
-            headers = request_info.getHeaders()
-            content_type = None
-            for header in headers:
-                if header.lower().startswith("content-type:"):
-                    content_type = header.split(":", 1)[1].strip()
-                    break
-
-            if not (content_type and (content_type.startswith('application/json') or content_type.startswith('application/graphql'))):
-                return None
-
-            body_offset = request_info.getBodyOffset()
-            body_bytes = request_bytes[body_offset:]
-            body_str = self._burp_helpers.bytesToString(body_bytes)
-
-            if '"operationName"' not in body_str:
-                return None
-
-            json_body = json.loads(body_str)
-            operation_name = json_body.get('operationName')
-
-            if operation_name:
-                return "[GraphQL] %s" % operation_name
-        except Exception:
-            # Ignore exceptions during parsing
-            pass
-
-        return None
+        return GraphqlHelpers.get_operation_name(self._burp_helpers, request_info, request_bytes)
 
     def _create_process_http_dialog_command(self, tool_flag, request_info, message_info):
         request_bytes = message_info.getRequest()
@@ -1412,12 +1569,23 @@ class ItemsBar(JPanel):
         self.add(TagPanel())
         self.add(TagOperatorPanel())
         self.add(self._prepare_separator())
+        self.add(PathFilterPanel())
+        self.add(self._prepare_separator())
         self.add(CapturingPanel())
 
     def _prepare_separator(self):
         separator = JSeparator(JSeparator.VERTICAL)
         separator.setPreferredSize(Dimension(2, 30))
         return separator
+
+
+class ItemsByPathFilter(object):
+    def __init__(self, search_text):
+        self._search_text = search_text.lower()
+
+    def __call__(self, *args, **kwargs):
+        item = args[0]
+        return self._search_text in item.get_path().lower()
 
 
 class ItemsByPathPatternsFilter(object):
@@ -1682,7 +1850,7 @@ class OptionsPanel(JPanel):
 
     def _add_label(self, label):
         panel = JPanel()
-        panel.add(JLabel('<html><h2>%s</h2></html>' % label))
+        panel.add(JLabel('%s' % label))
         self._add_panel(panel)
 
     def _add_panel(self, panel):
@@ -1700,6 +1868,37 @@ class OverwriteDuplicateItemsPanel(CheckBoxPanel):
 
     def _get_label(self):
         return 'Overwrite duplicate items'
+
+
+class PathFilterPanel(JPanel, DocumentListener):
+    __metaclass__ = Singleton
+
+    def __init__(self):
+        super(PathFilterPanel, self).__init__()
+        self._text_field = None
+
+    def display(self, values):
+        self.add(JLabel('Filter by Path:'))
+        self._text_field = JTextField(20)
+        self._text_field.setText(values.get('path_filter', ''))
+        self._text_field.getDocument().addDocumentListener(self)
+        self.add(self._text_field)
+
+    def _update_filter(self):
+        Application.get_instance().execute(SetDomainDictValueCommand(
+            SetDomainDictValueCommand.TYPE_VISIBLE_ITEMS,
+            'path_filter',
+            self._text_field.getText()
+        ))
+
+    def insertUpdate(self, e):
+        self._update_filter()
+
+    def removeUpdate(self, e):
+        self._update_filter()
+
+    def changedUpdate(self, e):
+        self._update_filter()
 
 
 class PathPattern(object):
@@ -2308,7 +2507,7 @@ class StatusPanel(JPanel, ItemListener):
         ))
 
     def display(self, values):
-        self.add(JLabel('<html><b>Statuses:</b></html>'))
+        self.add(JLabel('Statuses:'))
         for status in Application.ITEM_STATUSES:
             check_box = JCheckBox(status)
             check_box.setSelected(status in values['statuses'])
@@ -2327,7 +2526,7 @@ class TagOperatorPanel(JPanel, ItemListener):
         self._buttons = []
 
     def display(self, values):
-        self.add(JLabel('<html><b>Tag operator:</b></html>'))
+        self.add(JLabel('Tag operator:'))
         button_group = ButtonGroup()
         for option in self._OPTIONS:
             button = JRadioButton(option)
@@ -2366,7 +2565,7 @@ class TagPanel(JPanel, FocusListener):
         ))
 
     def display(self, values):
-        self.add(JLabel('<html><b>Tags:</b></html>'))
+        self.add(JLabel('Tags:'))
         self._prepare_components(values)
 
     def _prepare_components(self, values):
@@ -2419,6 +2618,15 @@ class UIHelpers(object):
             JOptionPane.ERROR_MESSAGE
         )
 
+    @staticmethod
+    def display_info(message, title):
+        JOptionPane.showMessageDialog(
+            Frame(),
+            message,
+            title,
+            JOptionPane.INFORMATION_MESSAGE
+        )
+
 
 class UIServices(object):
     def __init__(self):
@@ -2429,6 +2637,7 @@ class UIServices(object):
             ExcludedStatusCodesPanel(),
             HighlightPanel(),
             OverwriteDuplicateItemsPanel(),
+            PathFilterPanel(),
             ProcessOnlyInScopeRequestsPanel(),
             ScopeToolsPanel(),
             SetInProgressStatusWhenSendingItemToToolPanel(),
@@ -2449,6 +2658,9 @@ class UIServices(object):
 
     def display_error(self, message):
         UIHelpers.display_error(message)
+
+    def display_info(self, message, title):
+        UIHelpers.display_info(message, title)
 
     def display_http_dialog(self, item):
         HttpDialogEditor().display(item)
@@ -2487,6 +2699,7 @@ class VisibleItems(VisibleObjects):
             'statuses': Application.ITEM_STATUSES,
             'tags': [],
             'tag_operator': 'OR',
+            'path_filter': '',
         }
 
     def _get_filters(self):
@@ -2495,6 +2708,8 @@ class VisibleItems(VisibleObjects):
         ]
         if self._values['tags']:
             filters.append(ItemsByTagsFilter(self._values['tags'], self._values['tag_operator']))
+        if self._values.get('path_filter'):
+            filters.append(ItemsByPathFilter(self._values['path_filter']))
         return filters
 
     def _get_object_type(self):
