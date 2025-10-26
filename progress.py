@@ -20,6 +20,7 @@ from java.sql import DriverManager, SQLException, Statement, Types
 from javax.swing import (
     BoxLayout,
     ButtonGroup,
+    DefaultCellEditor,
     GroupLayout,
     JButton,
     JCheckBox,
@@ -615,7 +616,7 @@ class SetRequestStatusCommandHandler(object):
 
 class Application(object):
     ACTION_TOOLS = ['Intruder', 'Repeater', 'Scanner']
-    ITEM_STATUSES = ['New', 'Done', 'AuthTested', 'NA',]
+    ITEM_STATUSES = ['New', 'Done', 'AuthTested', 'NA', 'Blocked']
     SCOPE_TOOLS = ['Proxy', 'Repeater', 'Target']
 
     _instance = None
@@ -1627,7 +1628,7 @@ class ItemsColumnModel(TableColumnModel):
             ('Id', Integer, False, False),
             ('Path', String, False, False),
             ('Method', String, False, False),
-            ('Status', String, False, False),
+            ('Status', String, False, True),
             ('Tags', String, True, True),
             ('Comment', String, False, True),
             ('Target', String, False, False),
@@ -1691,6 +1692,15 @@ class ItemsPopupMenu(TablePopupMenu):
 
 
 class ItemsTable(Table):
+    def __init__(self):
+        super(ItemsTable, self).__init__()
+        self._prepare_cell_editors()
+
+    def _prepare_cell_editors(self):
+        status_column = self.getColumnModel().getColumn(3)
+        status_combo_box = JComboBox(Application.ITEM_STATUSES)
+        status_column.setCellEditor(DefaultCellEditor(status_combo_box))
+
     @staticmethod
     def _create_cell_renderer(column_name):
         if column_name == 'Status':
@@ -2467,12 +2477,11 @@ class SetSelectedItemPropertiesCommandHandler(object):
 
 class StatusCellRenderer(DefaultTableCellRenderer):
     COLORS = {
-        'Blocked': Color(255, 192, 203),
         'Done': Color(144, 238, 144),
-        'Ignored': Color.LIGHT_GRAY,
-        'In progress': Color(255, 255, 224),
+        'NA': Color.LIGHT_GRAY,
+        'AuthTested': Color(255, 240, 0),
         'New': Color.WHITE,
-        'Postponed': Color(135, 206, 250),
+        'Blocked': Color(255, 49, 49)
     }
 
     def getTableCellRendererComponent(self, table, value, is_selected, has_focus, row, column):
