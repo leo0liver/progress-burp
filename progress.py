@@ -13,11 +13,13 @@ from java.awt import BorderLayout
 from java.awt import Color
 from java.awt import Component
 from java.awt import Dimension
+from java.awt import FlowLayout
 from java.awt import Frame
-from java.awt.event import ActionListener, FocusListener, ItemListener, ItemEvent
+from java.awt.event import ActionListener, FocusListener, ItemListener, ItemEvent, InputEvent, KeyEvent
 from java.lang import Class, ClassNotFoundException, Integer, Runnable, String
 from java.sql import DriverManager, SQLException, Statement, Types
 from javax.swing import (
+    AbstractAction,
     BoxLayout,
     ButtonGroup,
     DefaultCellEditor,
@@ -38,7 +40,9 @@ from javax.swing import (
     JSplitPane,
     JTabbedPane,
     JTable,
+    JTextArea,
     JTextField,
+    KeyStroke,
     SwingUtilities,
 )
 from javax.swing.event import DocumentListener
@@ -616,7 +620,7 @@ class SetRequestStatusCommandHandler(object):
 
 class Application(object):
     ACTION_TOOLS = ['Intruder', 'Repeater', 'Scanner']
-    ITEM_STATUSES = ['New', 'Done', 'AuthTested', 'NA', 'Blocked']
+    ITEM_STATUSES = ['New', 'In progress', 'Done', 'AuthTested', 'NA', 'Blocked']
     SCOPE_TOOLS = ['Proxy', 'Repeater', 'Target']
 
     _instance = None
@@ -636,6 +640,7 @@ class Application(object):
         highlight_settings,
         item_repository,
         path_pattern_repository,
+        repeater_settings,
         ui_services,
         value_repository
     ):
@@ -644,7 +649,7 @@ class Application(object):
         persistence = Persistence(database, item_repository, path_pattern_repository, ui_services, value_repository)
         pre_analyze_validator = PreAnalyzeValidator(value_repository)
         pre_process_validator = PreProcessValidator(value_repository)
-        selected_items = SelectedItems(burp_services, item_repository, ui_services, value_repository)
+        selected_items = SelectedItems(burp_services, item_repository, repeater_settings, ui_services, value_repository)
         selected_path_patterns = SelectedPathPatterns(path_pattern_repository, ui_services, value_repository)
         visible_items = VisibleItems(item_repository, ui_services, value_repository)
         visible_path_patterns = VisiblePathPatterns(path_pattern_repository, ui_services, value_repository)
@@ -669,6 +674,7 @@ class Application(object):
                 persistence,
                 pre_analyze_validator,
                 pre_process_validator,
+                repeater_settings,
                 selected_items,
                 ui_services,
                 visible_items,
@@ -694,6 +700,7 @@ class Application(object):
                 persistence,
                 pre_analyze_validator,
                 pre_process_validator,
+                repeater_settings,
                 selected_items,
                 selected_path_patterns,
                 visible_items
@@ -761,6 +768,7 @@ class BurpExtender(IBurpExtender, IExtensionStateListener):
         item_repository = ItemRepository(database)
         path_pattern_repository = PathPatternRepository(database)
         highlight_settings = HighlightSettings(value_repository)
+        repeater_settings = RepeaterSettings(value_repository)
         duplicate_items = DuplicateItems(item_repository, path_pattern_repository, value_repository)
         
         listener.set_dependencies(duplicate_items, highlight_settings)
@@ -768,11 +776,12 @@ class BurpExtender(IBurpExtender, IExtensionStateListener):
         context_menu_factory = ContextMenuFactory(duplicate_items, helpers, ui_services)
 
         Application.set_instance(Application(
-            BurpServices(),
+            BurpServices(repeater_settings, ui_services),
             database,
             highlight_settings,
             item_repository,
             path_pattern_repository,
+            repeater_settings,
             ui_services,
             value_repository
         ))
@@ -796,16 +805,89 @@ class BurpHelpers(object):
 
 
 class BurpServices(object):
-    def __init__(self):
+    def __init__(self, repeater_settings, ui_services):
         self._burp_callbacks = BurpCallbacks.get_instance()
+        self._burp_helpers = BurpHelpers.get_instance()
+        self._repeater_settings = repeater_settings
+        self._ui_services = ui_services
 
     def send_items_to_tool(self, items, tool_name):
+        replacement_map = {}
+        settings = self._repeater_settings.get_values()
+        
+        if tool_name == 'Repeater' and settings.get('header_replacement_enabled'):
+            if settings.get('auto_header_retrieval_enabled'):
+                target_host = settings.get('auto_header_target_host', '').lower()
+                headers_to_find_str = settings.get('auto_headers_to_retrieve', '')
+                headers_to_find = {h.strip().lower() for h in headers_to_find_str.split(',') if h.strip()}
+                
+                if target_host and headers_to_find:
+                    found_request = False
+                    for message in reversed(self._burp_callbacks.getProxyHistory()):
+                        if message.getHttpService().getHost().lower() == target_host:
+                            request_info = self._burp_helpers.analyzeRequest(message.getRequest())
+                            if request_info.getMethod().upper() == 'OPTIONS':
+                                continue
+
+                            found_request = True
+                            for header in request_info.getHeaders():
+                                if ':' in header:
+                                    name, value = header.split(':', 1)
+                                    if name.lower() in headers_to_find:
+                                        replacement_map[name.lower()] = value.strip()
+                            break
+                    
+                    if not found_request:
+                        self._ui_services.display_info(
+                            'Automatic header retrieval failed: Could not find a non-OPTIONS request to host "%s" in Proxy History.\nFalling back to manual headers.' % target_host,
+                            'Header Retrieval Warning'
+                        )
+                    elif len(replacement_map) < len(headers_to_find):
+                        missing = headers_to_find - set(replacement_map.keys())
+                        self._ui_services.display_info(
+                            'Automatic header retrieval failed to find all headers for host "%s". Missing: %s.\nFalling back to manual headers.' % (target_host, ', '.join(missing)),
+                            'Header Retrieval Warning'
+                        )
+                        replacement_map.clear()
+
+            if not replacement_map:
+                manual_headers_str = settings.get('manual_headers', '')
+                for line in manual_headers_str.splitlines():
+                    if ':' in line:
+                        name, value = line.split(':', 1)
+                        replacement_map[name.strip().lower()] = value.strip()
+
         for item in items:
+            request_bytes = item.get_request().getBuffer()
+            
+            if tool_name == 'Repeater' and replacement_map:
+                request_info = self._burp_helpers.analyzeRequest(request_bytes)
+                original_headers = request_info.getHeaders()
+                body_bytes = request_bytes[request_info.getBodyOffset():]
+                
+                new_headers = [original_headers[0]]
+                headers_to_add = replacement_map.copy()
+
+                for header in original_headers[1:]:
+                    if ':' in header:
+                        header_name = header.split(':', 1)[0]
+                        if header_name.lower() in headers_to_add:
+                            new_headers.append(header_name + ": " + headers_to_add.pop(header_name.lower()))
+                        else:
+                            new_headers.append(header)
+                    else:
+                        new_headers.append(header)
+                
+                for name, value in headers_to_add.items():
+                    new_headers.append(name.title() + ": " + value)
+
+                request_bytes = self._burp_helpers.buildHttpMessage(new_headers, body_bytes)
+
             params = [
                 item.get_host(),
                 item.get_port(),
                 item.get_protocol() == 'https',
-                item.get_request().getBuffer()
+                request_bytes
             ]
             if tool_name == 'Repeater':
                 params.append(None)
@@ -1133,6 +1215,14 @@ class ExcludedStatusCodesPanel(TextFieldPanel):
         return SetDomainDictValueCommand.TYPE_PRE_PROCESS_VALIDATOR
 
 
+class ExcludedHttpMethodsPanel(TextFieldPanel):
+    def _get_domain_dict_key(self):
+        return 'excluded_http_methods'
+
+    def _get_domain_dict_type(self):
+        return SetDomainDictValueCommand.TYPE_PRE_PROCESS_VALIDATOR
+
+
 class ExecuteApplicationCommandInGuiThread(Runnable):
     def __init__(self, command):
         self.command = command
@@ -1251,7 +1341,8 @@ class HttpListener(IHttpListener):
         return MakePreProcessValidationCommand(
             request_info.getUrl().getPath().rsplit('.', 1)[-1].lower(),
             self._burp_callbacks.isInScope(request_info.getUrl()),
-            str(response_info.getStatusCode())
+            str(response_info.getStatusCode()),
+            request_info.getMethod()
         )
 
     def _get_graphql_operation_name(self, request_info, request_bytes):
@@ -1346,6 +1437,7 @@ class InitCommandHandler(object):
             persistence,
             pre_analyze_validator,
             pre_process_validator,
+            repeater_settings,
             selected_items,
             ui_services,
             visible_items,
@@ -1357,6 +1449,7 @@ class InitCommandHandler(object):
             persistence,
             pre_analyze_validator,
             pre_process_validator,
+            repeater_settings,
             selected_items,
             visible_items
         ]
@@ -1691,10 +1784,29 @@ class ItemsPopupMenu(TablePopupMenu):
         return labels
 
 
+class SendToRepeaterAction(AbstractAction):
+    def __init__(self):
+        super(SendToRepeaterAction, self).__init__()
+
+    def actionPerformed(self, event):
+        Application.get_instance().execute(
+            SendSelectedItemsToToolCommand('Repeater')
+        )
+
+
 class ItemsTable(Table):
     def __init__(self):
         super(ItemsTable, self).__init__()
         self._prepare_cell_editors()
+
+        action_name = "send-to-repeater"
+        key_stroke = KeyStroke.getKeyStroke(KeyEvent.VK_R, InputEvent.CTRL_MASK)
+
+        input_map = self.getInputMap(self.WHEN_FOCUSED)
+        action_map = self.getActionMap()
+
+        input_map.put(key_stroke, action_name)
+        action_map.put(action_name, SendToRepeaterAction())
 
     def _prepare_cell_editors(self):
         status_column = self.getColumnModel().getColumn(3)
@@ -1758,10 +1870,11 @@ class MakePreAnalyzeValidationCommandHandler(object):
 
 
 class MakePreProcessValidationCommand(object):
-    def __init__(self, extension, is_in_scope, status_code):
+    def __init__(self, extension, is_in_scope, status_code, method):
         self.extension = extension
         self.is_in_scope = is_in_scope
         self.status_code = status_code
+        self.method = method
 
 
 class MakePreProcessValidationCommandHandler(object):
@@ -1772,7 +1885,8 @@ class MakePreProcessValidationCommandHandler(object):
         return self._pre_process_validator.validate(
             command.extension,
             command.is_in_scope,
-            command.status_code
+            command.status_code,
+            command.method
         )
 
 
@@ -1786,6 +1900,125 @@ class HighlightSettings(DomainDict):
 
     def _get_storage_key(self):
         return 'HighlightSettings'
+
+
+class RepeaterSettings(DomainDict):
+    def _get_default_values(self):
+        return {
+            'header_replacement_enabled': False,
+            'manual_headers': '',
+            'auto_header_retrieval_enabled': False,
+            'auto_header_target_host': '',
+            'auto_headers_to_retrieve': '',
+        }
+
+    def _get_storage_key(self):
+        return 'RepeaterSettings'
+
+
+class RepeaterSettingsPanel(JPanel, ItemListener, DocumentListener):
+    __metaclass__ = Singleton
+
+    def __init__(self):
+        super(RepeaterSettingsPanel, self).__init__()
+        self._check_box = None
+        self._auto_check_box = None
+        self._target_host_field = None
+        self._headers_to_retrieve_field = None
+        self._manual_headers_area = None
+
+    def display(self, values):
+        self.setLayout(BoxLayout(self, BoxLayout.Y_AXIS))
+
+        # Main enable/disable
+        main_panel = JPanel(FlowLayout(FlowLayout.LEFT))
+        self._check_box = JCheckBox("Enable Repeater Header Replacement")
+        self._check_box.setSelected(values.get('header_replacement_enabled', False))
+        self._check_box.addItemListener(self)
+        main_panel.add(self._check_box)
+        main_panel.setAlignmentX(Component.LEFT_ALIGNMENT)
+        self.add(main_panel)
+
+        # Auto-retrieval settings
+        auto_panel = JPanel()
+        auto_panel.setLayout(BoxLayout(auto_panel, BoxLayout.Y_AXIS))
+        
+        auto_cb_panel = JPanel(FlowLayout(FlowLayout.LEFT))
+        self._auto_check_box = JCheckBox("Enable automatic header retrieval")
+        self._auto_check_box.setSelected(values.get('auto_header_retrieval_enabled', False))
+        self._auto_check_box.addItemListener(self)
+        auto_cb_panel.add(self._auto_check_box)
+        auto_panel.add(auto_cb_panel)
+
+        host_panel = JPanel(FlowLayout(FlowLayout.LEFT))
+        host_panel.add(JLabel("Target Host:"))
+        self._target_host_field = JTextField(30)
+        self._target_host_field.setText(values.get('auto_header_target_host', ''))
+        self._target_host_field.getDocument().addDocumentListener(self)
+        host_panel.add(self._target_host_field)
+        auto_panel.add(host_panel)
+
+        retrieve_panel = JPanel(FlowLayout(FlowLayout.LEFT))
+        retrieve_panel.add(JLabel("Headers to Retrieve (comma-separated):"))
+        self._headers_to_retrieve_field = JTextField(30)
+        self._headers_to_retrieve_field.setText(values.get('auto_headers_to_retrieve', ''))
+        self._headers_to_retrieve_field.getDocument().addDocumentListener(self)
+        retrieve_panel.add(self._headers_to_retrieve_field)
+        auto_panel.add(retrieve_panel)
+        
+        auto_panel.setAlignmentX(Component.LEFT_ALIGNMENT)
+        self.add(auto_panel)
+
+        # Manual override settings
+        manual_panel = JPanel()
+        manual_panel.setLayout(BoxLayout(manual_panel, BoxLayout.Y_AXIS))
+        
+        manual_title_panel = JPanel(FlowLayout(FlowLayout.LEFT))
+        manual_title_panel.add(JLabel("Manual Override Headers (one per line):"))
+        manual_panel.add(manual_title_panel)
+        
+        self._manual_headers_area = JTextArea(5, 50)
+        self._manual_headers_area.setText(values.get('manual_headers', ''))
+        self._manual_headers_area.getDocument().addDocumentListener(self)
+        scroll_pane = JScrollPane(self._manual_headers_area)
+        manual_panel.add(scroll_pane)
+        manual_panel.setAlignmentX(Component.LEFT_ALIGNMENT)
+        
+        self.add(manual_panel)
+
+    def itemStateChanged(self, event):
+        source = event.getSource()
+        if source == self._check_box:
+            self._set_domain_dict_value('header_replacement_enabled', self._check_box.isSelected())
+        elif source == self._auto_check_box:
+            self._set_domain_dict_value('auto_header_retrieval_enabled', self._auto_check_box.isSelected())
+
+    def _update_text_field(self, event):
+        doc = event.getDocument()
+        if doc == self._target_host_field.getDocument():
+            self._set_domain_dict_value('auto_header_target_host', self._target_host_field.getText())
+        elif doc == self._headers_to_retrieve_field.getDocument():
+            self._set_domain_dict_value('auto_headers_to_retrieve', self._headers_to_retrieve_field.getText())
+        elif doc == self._manual_headers_area.getDocument():
+            self._set_domain_dict_value('manual_headers', self._manual_headers_area.getText())
+
+    def insertUpdate(self, e):
+        self._update_text_field(e)
+
+    def removeUpdate(self, e):
+        self._update_text_field(e)
+
+    def changedUpdate(self, e):
+        self._update_text_field(e)
+
+    def _set_domain_dict_value(self, key, value):
+        # This requires SetDomainDictValueCommand.TYPE_REPEATER_SETTINGS to be defined.
+        # We will add this definition in a later step.
+        Application.get_instance().execute(SetDomainDictValueCommand(
+            9, # TYPE_REPEATER_SETTINGS
+            key,
+            value
+        ))
 
 
 class HighlightPanel(JPanel, ItemListener):
@@ -1851,12 +2084,16 @@ class OptionsPanel(JPanel):
         self._add_panel(ExcludedExtensionsPanel())
         self._add_label('Excluded status codes')
         self._add_panel(ExcludedStatusCodesPanel())
+        self._add_label('Excluded HTTP methods')
+        self._add_panel(ExcludedHttpMethodsPanel())
         self._add_label('Misc')
         self._add_panel(OverwriteDuplicateItemsPanel())
         self._add_panel(ProcessOnlyInScopeRequestsPanel())
         self._add_panel(SetInProgressStatusWhenSendingItemToToolPanel())
         self._add_label('Highlighting')
         self._add_panel(HighlightPanel())
+        self._add_label('Repeater Header Replacement')
+        self._add_panel(RepeaterSettingsPanel())
 
     def _add_label(self, label):
         panel = JPanel()
@@ -2148,18 +2385,24 @@ class PreProcessValidator(DomainDictWithLock):
             'excluded_extensions': ['css', 'js', 'gif', 'ico', 'jpg', 'jpeg', 'png', 'svg', 'woff', 'woff2'],
             'excluded_status_codes': ['404'],
             'process_only_in_scope_requests': True,
+            'excluded_http_methods': ['OPTIONS'],
         }
 
     # business logic
-    def validate(self, extension, is_in_scope, status_code):
+    def validate(self, extension, is_in_scope, status_code, method):
         with self._lock:
             return \
                 self._validate_extension(extension) and \
                 self._validate_scope(is_in_scope) and \
-                self._validate_status_code(status_code)
+                self._validate_status_code(status_code) and \
+                self._validate_method(method)
 
     def _validate_extension(self, extension):
         return extension not in self._values['excluded_extensions']
+
+    def _validate_method(self, method):
+        excluded_methods = [m.upper() for m in self._values['excluded_http_methods']]
+        return method.upper() not in excluded_methods
 
     def _validate_scope(self, is_in_scope):
         if self._values['process_only_in_scope_requests']:
@@ -2267,10 +2510,11 @@ class ScopeToolsPanel(JPanel, ItemListener):
 
 
 class SelectedItems(SelectedObjects):
-    def __init__(self, burp_services, item_repository, ui_services, value_repository):
+    def __init__(self, burp_services, item_repository, repeater_settings, ui_services, value_repository):
         super(SelectedItems, self).__init__(item_repository, ui_services, value_repository)
         self._burp_services = burp_services
         self._item_repository = item_repository
+        self._repeater_settings = repeater_settings
         self._ui_services = ui_services
 
     # DomainDict
@@ -2294,7 +2538,11 @@ class SelectedItems(SelectedObjects):
     def send_selected_items_to_tool(self, tool_name):
         self._burp_services.send_items_to_tool(self._find_selected_items(), tool_name)
         if self._values['set_in_progress_status_when_sending_item_to_tool']:
-            self.set_selected_item_properties('status', 'In progress')
+            status_to_set = 'In progress'
+            repeater_settings = self._repeater_settings.get_values()
+            if tool_name == 'Repeater' and repeater_settings.get('header_replacement_enabled'):
+                status_to_set = 'AuthTested'
+            self.set_selected_item_properties('status', status_to_set)
 
     def set_selected_item_properties(self, property, value):
         if value is None:
@@ -2397,6 +2645,7 @@ class SetDomainDictValueCommand(object):
     TYPE_SELECTED_PATH_PATTERNS = 6
     TYPE_VISIBLE_ITEMS = 7
     TYPE_HIGHLIGHT_SETTINGS = 8
+    TYPE_REPEATER_SETTINGS = 9
 
     def __init__(self, type, key, value):
         self.type = type
@@ -2412,6 +2661,7 @@ class SetDomainDictValueCommandHandler(object):
         persistence,
         pre_analyze_validator,
         pre_process_validator,
+        repeater_settings,
         selected_items,
         selected_path_patterns,
         visible_items
@@ -2422,6 +2672,7 @@ class SetDomainDictValueCommandHandler(object):
             SetDomainDictValueCommand.TYPE_PERSISTENCE: persistence,
             SetDomainDictValueCommand.TYPE_PRE_ANALYZE_VALIDATOR: pre_analyze_validator,
             SetDomainDictValueCommand.TYPE_PRE_PROCESS_VALIDATOR: pre_process_validator,
+            SetDomainDictValueCommand.TYPE_REPEATER_SETTINGS: repeater_settings,
             SetDomainDictValueCommand.TYPE_SELECTED_ITEMS: selected_items,
             SetDomainDictValueCommand.TYPE_SELECTED_PATH_PATTERNS: selected_path_patterns,
             SetDomainDictValueCommand.TYPE_VISIBLE_ITEMS: visible_items,
@@ -2481,6 +2732,7 @@ class StatusCellRenderer(DefaultTableCellRenderer):
         'NA': Color.LIGHT_GRAY,
         'AuthTested': Color(255, 240, 0),
         'New': Color.WHITE,
+        'In progress': Color(255, 165, 0),
         'Blocked': Color(255, 49, 49)
     }
 
@@ -2643,11 +2895,13 @@ class UIServices(object):
             CapturingPanel(),
             DatabasePanel(),
             ExcludedExtensionsPanel(),
+            ExcludedHttpMethodsPanel(),
             ExcludedStatusCodesPanel(),
             HighlightPanel(),
             OverwriteDuplicateItemsPanel(),
             PathFilterPanel(),
             ProcessOnlyInScopeRequestsPanel(),
+            RepeaterSettingsPanel(),
             ScopeToolsPanel(),
             SetInProgressStatusWhenSendingItemToToolPanel(),
             StatusPanel(),
