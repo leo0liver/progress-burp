@@ -1594,19 +1594,19 @@ class ItemRepository(Repository):
     def _create_table(self):
         self._database.execute(
             'CREATE TABLE items('
-            'comment TEXT NOT NULL,
-            'host TEXT NOT NULL,
-            'id INTEGER PRIMARY KEY,
-            'method TEXT NOT NULL,
-            'path TEXT NOT NULL,
-            'port INTEGER NOT NULL,
-            'protocol TEXT NOT NULL,
-            'request TEXT NOT NULL,
-            'response TEXT NOT NULL,
-            'status TEXT NOT NULL,
-            'tags TEXT NOT NULL,
-            'time TEXT NOT NULL,
-            'tool TEXT NOT NULL,
+            'comment TEXT NOT NULL,'
+            'host TEXT NOT NULL,'
+            'id INTEGER PRIMARY KEY,'
+            'method TEXT NOT NULL,'
+            'path TEXT NOT NULL,'
+            'port INTEGER NOT NULL,'
+            'protocol TEXT NOT NULL,'
+            'request TEXT NOT NULL,'
+            'response TEXT NOT NULL,'
+            'status TEXT NOT NULL,'
+            'tags TEXT NOT NULL,'
+            'time TEXT NOT NULL,'
+            'tool TEXT NOT NULL,'
             'UNIQUE(protocol, host, port, method, path) ON CONFLICT IGNORE)'
         )
 
@@ -2306,10 +2306,10 @@ class PathPatternRepository(Repository):
     def _create_table(self):
         self._database.execute(
             'CREATE TABLE path_patterns('
-            'id INTEGER PRIMARY KEY,
-            'method TEXT NOT NULL,
-            'path_regexp TEXT NOT NULL,
-            'target TEXT NOT NULL,
+            'id INTEGER PRIMARY KEY,'
+            'method TEXT NOT NULL,'
+            'path_regexp TEXT NOT NULL,'
+            'target TEXT NOT NULL,'
             'UNIQUE(method, path_regexp, target) ON CONFLICT IGNORE)'
         )
 
