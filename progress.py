@@ -639,6 +639,7 @@ class Application(object):
         database,
         highlight_settings,
         item_repository,
+        method_coverage_settings,
         path_pattern_repository,
         repeater_settings,
         ui_services,
@@ -671,6 +672,7 @@ class Application(object):
             InitCommand.__name__: InitCommandHandler(
                 duplicate_items,
                 highlight_settings,
+                method_coverage_settings,
                 persistence,
                 pre_analyze_validator,
                 pre_process_validator,
@@ -697,6 +699,7 @@ class Application(object):
             SetDomainDictValueCommand.__name__: SetDomainDictValueCommandHandler(
                 duplicate_items,
                 highlight_settings,
+                method_coverage_settings,
                 persistence,
                 pre_analyze_validator,
                 pre_process_validator,
@@ -750,9 +753,9 @@ class BurpExtender(IBurpExtender, IExtensionStateListener):
         helpers = BurpHelpers.get_instance()
 
         listener = HttpListener()
-        context_menu_factory = self._prepare_application(listener, helpers)
+        context_menu_factory, method_coverage_tab = self._prepare_application(listener, helpers)
         
-        callbacks.addSuiteTab(ProgressTab())
+        callbacks.addSuiteTab(ProgressTab(method_coverage_tab))
         callbacks.registerExtensionStateListener(self)
         callbacks.registerHttpListener(listener)
         callbacks.registerContextMenuFactory(context_menu_factory)
@@ -768,6 +771,7 @@ class BurpExtender(IBurpExtender, IExtensionStateListener):
         item_repository = ItemRepository(database)
         path_pattern_repository = PathPatternRepository(database)
         highlight_settings = HighlightSettings(value_repository)
+        method_coverage_settings = MethodCoverageSettings(value_repository)
         repeater_settings = RepeaterSettings(value_repository)
         duplicate_items = DuplicateItems(item_repository, path_pattern_repository, value_repository)
         
@@ -780,13 +784,16 @@ class BurpExtender(IBurpExtender, IExtensionStateListener):
             database,
             highlight_settings,
             item_repository,
+            method_coverage_settings,
             path_pattern_repository,
             repeater_settings,
             ui_services,
             value_repository
         ))
 
-        return context_menu_factory
+        method_coverage_tab = MethodCoverageTab(item_repository, method_coverage_settings)
+
+        return context_menu_factory, method_coverage_tab
 
 
 class BurpHelpers(object):
@@ -1434,6 +1441,7 @@ class InitCommandHandler(object):
             self,
             duplicate_items,
             highlight_settings,
+            method_coverage_settings,
             persistence,
             pre_analyze_validator,
             pre_process_validator,
@@ -1446,6 +1454,7 @@ class InitCommandHandler(object):
         self._domain_dicts = [
             duplicate_items,
             highlight_settings,
+            method_coverage_settings,
             persistence,
             pre_analyze_validator,
             pre_process_validator,
@@ -1890,6 +1899,104 @@ class MakePreProcessValidationCommandHandler(object):
         )
 
 
+class MethodCoverageSettingsPanel(TextFieldPanel):
+    def _get_domain_dict_key(self):
+        return 'methods_to_check'
+
+    def _get_domain_dict_type(self):
+        return SetDomainDictValueCommand.TYPE_METHOD_COVERAGE_SETTINGS
+
+    def display(self, values):
+        self.add(JLabel('Methods to check for coverage:'))
+        self._prepare_components(values)
+
+
+class MethodCoverageTableModel(AbstractTableModel):
+    def __init__(self):
+        self._column_names = ["Endpoint Path", "Missing Methods"]
+        self._data = []
+
+    def getColumnCount(self):
+        return len(self._column_names)
+
+    def getRowCount(self):
+        return len(self._data)
+
+    def getColumnName(self, col):
+        return self._column_names[col]
+
+    def getValueAt(self, row, col):
+        return self._data[row][col]
+
+    def setData(self, data):
+        self._data = data
+        self.fireTableDataChanged()
+
+
+class MethodCoverageTable(JTable):
+    def __init__(self):
+        self._model = MethodCoverageTableModel()
+        self.setModel(self._model)
+        self.setAutoCreateRowSorter(True)
+
+    def getModel(self):
+        return self._model
+
+
+class MethodCoverageTab(ITab, ActionListener):
+    def __init__(self, item_repository, method_coverage_settings):
+        self._item_repository = item_repository
+        self._method_coverage_settings = method_coverage_settings
+
+        self._ui_component = JPanel(BorderLayout())
+        self._table = MethodCoverageTable()
+        
+        refresh_button = JButton("Refresh")
+        refresh_button.addActionListener(self)
+        
+        top_panel = JPanel()
+        top_panel.add(refresh_button)
+
+        self._ui_component.add(top_panel, BorderLayout.NORTH)
+        self._ui_component.add(JScrollPane(self._table), BorderLayout.CENTER)
+
+        BurpCallbacks.get_instance().customizeUiComponent(self._ui_component)
+
+    def getTabCaption(self):
+        return "Method Coverage"
+
+    def getUiComponent(self):
+        return self._ui_component
+
+    def actionPerformed(self, event):
+        # Analysis Logic
+        settings = self._method_coverage_settings.get_values()
+        target_methods = {m.upper() for m in settings.get('methods_to_check', [])}
+
+        endpoints = {}
+        all_items = self._item_repository.find_all()
+        for item in all_items:
+            path = item.get_path()
+            method = item.get_method().upper()
+            if path not in endpoints:
+                endpoints[path] = set()
+            endpoints[path].add(method)
+        
+        report_data = []
+        for path, seen_methods in sorted(endpoints.items()):
+            if path.startswith('[GraphQL]'):
+                continue # Completely ignore GraphQL endpoints
+
+            methods_to_check_against = target_methods
+            
+            missing_methods = methods_to_check_against - seen_methods
+
+            if missing_methods:
+                report_data.append([path, ', '.join(list(missing_methods))])
+        
+        self._table.getModel().setData(report_data)
+
+
 class HighlightSettings(DomainDict):
     def _get_default_values(self):
         return {
@@ -1900,6 +2007,16 @@ class HighlightSettings(DomainDict):
 
     def _get_storage_key(self):
         return 'HighlightSettings'
+
+
+class MethodCoverageSettings(DomainDict):
+    def _get_default_values(self):
+        return {
+            'methods_to_check': ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'],
+        }
+
+    def _get_storage_key(self):
+        return 'MethodCoverageSettings'
 
 
 class RepeaterSettings(DomainDict):
@@ -2092,6 +2209,8 @@ class OptionsPanel(JPanel):
         self._add_panel(SetInProgressStatusWhenSendingItemToToolPanel())
         self._add_label('Highlighting')
         self._add_panel(HighlightPanel())
+        self._add_label('Method Coverage Analysis')
+        self._add_panel(MethodCoverageSettingsPanel())
         self._add_label('Repeater Header Replacement')
         self._add_panel(RepeaterSettingsPanel())
 
@@ -2465,11 +2584,12 @@ class ProcessOnlyInScopeRequestsPanel(CheckBoxPanel):
 
 
 class ProgressTab(ITab):
-    def __init__(self):
+    def __init__(self, method_coverage_tab):
         self._ui_component = JTabbedPane()
         self._ui_component.addTab('Items', ItemsPanel())
         self._ui_component.addTab('Path patterns', PathPatternsPanel())
         self._ui_component.addTab('Options', JScrollPane(OptionsPanel()))
+        self._ui_component.addTab('Method Coverage', method_coverage_tab.getUiComponent())
         BurpCallbacks.get_instance().customizeUiComponent(self._ui_component)
 
     def getTabCaption(self):
@@ -2646,6 +2766,7 @@ class SetDomainDictValueCommand(object):
     TYPE_VISIBLE_ITEMS = 7
     TYPE_HIGHLIGHT_SETTINGS = 8
     TYPE_REPEATER_SETTINGS = 9
+    TYPE_METHOD_COVERAGE_SETTINGS = 10
 
     def __init__(self, type, key, value):
         self.type = type
@@ -2658,6 +2779,7 @@ class SetDomainDictValueCommandHandler(object):
         self,
         duplicate_items,
         highlight_settings,
+        method_coverage_settings,
         persistence,
         pre_analyze_validator,
         pre_process_validator,
@@ -2669,6 +2791,7 @@ class SetDomainDictValueCommandHandler(object):
         self._domain_dict_handlers = {
             SetDomainDictValueCommand.TYPE_DUPLICATE_ITEMS: duplicate_items,
             SetDomainDictValueCommand.TYPE_HIGHLIGHT_SETTINGS: highlight_settings,
+            SetDomainDictValueCommand.TYPE_METHOD_COVERAGE_SETTINGS: method_coverage_settings,
             SetDomainDictValueCommand.TYPE_PERSISTENCE: persistence,
             SetDomainDictValueCommand.TYPE_PRE_ANALYZE_VALIDATOR: pre_analyze_validator,
             SetDomainDictValueCommand.TYPE_PRE_PROCESS_VALIDATOR: pre_process_validator,
@@ -2898,6 +3021,7 @@ class UIServices(object):
             ExcludedHttpMethodsPanel(),
             ExcludedStatusCodesPanel(),
             HighlightPanel(),
+            MethodCoverageSettingsPanel(),
             OverwriteDuplicateItemsPanel(),
             PathFilterPanel(),
             ProcessOnlyInScopeRequestsPanel(),
